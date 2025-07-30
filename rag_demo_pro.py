@@ -29,42 +29,46 @@ import jieba
 import threading
 from functools import lru_cache
 from typing import List, Tuple, Any, Optional
+from docx import Document
+import pandas as pd
+from bs4 import BeautifulSoup
 
 # 加载环境变量
 load_dotenv()
-SERPAPI_KEY = os.getenv("SERPAPI_KEY")  # В .env файле установите SERPAPI_KEY
-SEARCH_ENGINE = "google"  # Можно изменить на другую поисковую систему при необходимости
-# Новое: Конфигурация метода переранжирования (кросс-энкодер или LLM)
-RERANK_METHOD = os.getenv("RERANK_METHOD", "cross_encoder")  # "cross_encoder" или "llm"
-# Новое: Конфигурация SiliconFlow API
+SERPAPI_KEY = os.getenv("SERPAPI_KEY")  # 在 .env 文件中设置 SERPAPI_KEY
+SEARCH_ENGINE = "google"  # 可以根据需要更改为其他搜索引擎
+# 新增：配置重排序方法（交叉编码器或 LLM）
+RERANK_METHOD = os.getenv("RERANK_METHOD", "cross_encoder")  # "cross_encoder" 或 "llm"
+# 新增：配置 SiliconFlow API
 SILICONFLOW_API_KEY = os.getenv("SILICONFLOW_API_KEY")
 SILICONFLOW_API_URL = os.getenv("SILICONFLOW_API_URL", "https://api.siliconflow.cn/v1/chat/completions")
 
-# В начале файла добавляем настройки таймаута
+# 在文件开头添加请求超时设置
 import requests
-requests.adapters.DEFAULT_RETRIES = 3  # Увеличиваем количество попыток
+requests.adapters.DEFAULT_RETRIES = 3  # 增加请求重试次数
 
-# В начале файла добавляем настройки переменных окружения
-os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'  # Отключаем оптимизацию oneDNN
+# 在文件开头添加环境变量设置
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'  # 禁用 oneDNN 优化
 
-# В самом начале файла добавляем конфигурацию прокси
+# 在文件开头添加代理配置
 import os
-os.environ['NO_PROXY'] = 'localhost,127.0.0.1'  # Новая настройка обхода прокси
+os.environ['NO_PROXY'] = 'localhost,127.0.0.1'  # 新增：设置不使用代理的地址
 
-# Инициализация компонентов
+# 初始化组件
 EMBED_MODEL = SentenceTransformer('all-MiniLM-L6-v2')
-# Модель для эмбеддингов также можно переключить на модель, оптимизированную для китайского языка, например:
+# 嵌入模型也可以切换为针对中文优化的模型，例如：
 # EMBED_MODEL = SentenceTransformer('shibing624/text2vec-base-chinese')
 
-# FAISS相关的 глобальные переменные
+# FAISS 相关的全局变量
 faiss_index = None
-faiss_contents_map = {}  # original_id -> content
-faiss_metadatas_map = {} # original_id -> metadata
-faiss_id_order_for_index = [] # Сохраняет порядок ID, как они были добавлены в FAISS
+faiss_contents_map = {}  # original_id -> 文本内容
+faiss_metadatas_map = {} # original_id -> 元数据
+faiss_id_order_for_index = [] # 保存添加到 FAISS 的 ID 顺序
 
-# Новое: Инициализация кросс-энкодера (отложенная загрузка)
+# 新增：初始化交叉编码器（延迟加载）
 cross_encoder = None
 cross_encoder_lock = threading.Lock()
+
 
 def get_cross_encoder():
     """延迟加载交叉编码器模型"""
@@ -103,10 +107,12 @@ def recursive_retrieval(initial_query, max_iterations=3, enable_web_search=False
     all_metadata = []
     
     global faiss_index, faiss_contents_map, faiss_metadatas_map, faiss_id_order_for_index
-    
+
+    # 🔄 迭代检索循环
     for i in range(max_iterations):
         logging.info(f"递归检索迭代 {i+1}/{max_iterations}，当前查询: {query}")
         
+        # 1️⃣ 网络搜索（可选
         web_results_texts = [] # Store text from web results for context building
         if enable_web_search and check_serpapi_key():
             try:
@@ -122,7 +128,8 @@ def recursive_retrieval(initial_query, max_iterations=3, enable_web_search=False
                     # For now, web results are added as pure text context, not searched semantically *again* within this loop's FAISS query.
             except Exception as e:
                 logging.error(f"网络搜索错误: {str(e)}")
-        
+
+        # 2️⃣ 语义检索 (FAISS)
         query_embedding = EMBED_MODEL.encode([query])
         query_embedding_np = np.array(query_embedding).astype('float32')
         
@@ -142,12 +149,14 @@ def recursive_retrieval(initial_query, max_iterations=3, enable_web_search=False
                         semantic_results_ids.append(original_id)
             except Exception as e:
                 logging.error(f"FAISS 检索错误: {str(e)}")
-        
+
+        # 3️⃣ 关键词检索 (BM25)
         bm25_results = BM25_MANAGER.search(query, top_k=10) # BM25_MANAGER.search returns list of dicts
         
         # Adapt hybrid_merge to work with current data structures
         # It expects semantic_results in a specific format if we pass it directly
         # For now, prepare a structure similar to old semantic_results for hybrid_merge
+        # 4️⃣ 混合检索结果合并
         prepared_semantic_results_for_hybrid = {
             "ids": [semantic_results_ids],
             "documents": [semantic_results_docs],
@@ -165,7 +174,8 @@ def recursive_retrieval(initial_query, max_iterations=3, enable_web_search=False
                 doc_ids_current_iter.append(doc_id)
                 docs_current_iter.append(result_data['content'])
                 metadata_list_current_iter.append(result_data['metadata'])
-        
+
+        # 5️⃣ 重排序
         if docs_current_iter:
             try:
                 reranked_results = rerank_results(query, docs_current_iter, doc_ids_current_iter, metadata_list_current_iter, top_k=5)
@@ -186,7 +196,8 @@ def recursive_retrieval(initial_query, max_iterations=3, enable_web_search=False
                 all_contexts.append(doc)
                 all_metadata.append(metadata)
             current_contexts_for_llm.append(doc) # Add reranked local docs for LLM context
-        
+
+        # 6️⃣ 智能判断是否继续迭代
         if i == max_iterations - 1:
             break
             
@@ -210,7 +221,7 @@ def recursive_retrieval(initial_query, max_iterations=3, enable_web_search=False
             try:
                 if model_choice == "siliconflow":
                     logging.info("使用SiliconFlow API分析是否需要进一步查询")
-                    next_query_result = call_siliconflow_api(next_query_prompt, temperature=0.7, max_tokens=256)
+                    next_query_result = call_siliconflow_api(next_query_prompt, temperature=0.3, max_tokens=256)
                     # SiliconFlow API返回格式包含回答和可能的思维链，这里只需要回答部分来判断是否继续
                     # 假设call_siliconflow_api返回的是一个元组 (回答, 思维链) 或只是回答字符串
                     if isinstance(next_query_result, tuple):
@@ -228,7 +239,7 @@ def recursive_retrieval(initial_query, max_iterations=3, enable_web_search=False
                     response = session.post(
                         "http://localhost:11434/api/generate",
                         json={
-                            "model": "deepseek-r1:1.5b",
+                            "model": "deepseek-r1:1.5b",  # 小模型足以胜任分析任务
                             "prompt": next_query_prompt,
                             "stream": False
                         },
@@ -487,11 +498,37 @@ def evaluate_source_credibility(source):
     return 0.5  # 默认中等可信度
 
 def extract_text(filepath):
-    """改进的PDF文本提取方法"""
+    """多格式文档文本提取"""
+    ext = os.path.splitext(filepath)[-1].lower()
     output = StringIO()
-    with open(filepath, 'rb') as file:
-        extract_text_to_fp(file, output)
-    return output.getvalue()
+    try:
+        if ext == ".pdf":
+            with open(filepath, 'rb') as file:
+                extract_text_to_fp(file, output)
+            return output.getvalue()
+        elif ext == ".txt":
+            with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                return f.read()
+        elif ext == ".docx":
+            doc = Document(filepath)
+            return "\n".join([para.text for para in doc.paragraphs])
+        elif ext == ".csv":
+            df = pd.read_csv(filepath)
+            return df.to_string(index=False)
+        elif ext in [".xls", ".xlsx"]:
+            df = pd.read_excel(filepath)
+            return df.to_string(index=False)
+        elif ext == ".html":
+            with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                soup = BeautifulSoup(f.read(), "html.parser")
+                return soup.get_text(separator="\n")
+        elif ext == ".md":
+            with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                return f.read()
+        else:
+            return f"暂不支持该文件类型: {ext}"
+    except Exception as e:
+        return f"文件解析失败: {str(e)}"
 
 def process_multiple_pdfs(files: List[Any], progress=gr.Progress()):
     """处理多个PDF文件"""
@@ -540,6 +577,7 @@ def process_multiple_pdfs(files: List[Any], progress=gr.Progress()):
                 if not chunks:
                     raise ValueError("文档内容为空或无法提取文本")
                 
+                #元数据管理
                 doc_id = f"doc_{int(time.time())}_{idx}"
                 
                 # Store chunks and metadatas temporarily before batch embedding
@@ -618,14 +656,14 @@ def rerank_with_cross_encoder(query, docs, doc_ids, metadata_list, top_k=5):
         return [(doc_id, {'content': doc, 'metadata': meta, 'score': 1.0 - idx/len(docs)}) 
                 for idx, (doc_id, doc, meta) in enumerate(zip(doc_ids, docs, metadata_list))]
     
-    # 准备交叉编码器输入
+    # 准备交叉编码器输入，构建查询-文档对
     cross_inputs = [[query, doc] for doc in docs]
     
     try:
         # 计算相关性得分
         scores = encoder.predict(cross_inputs)
         
-        # 组合结果
+        # 📊 组合结果并排序
         results = [
             (doc_id, {
                 'content': doc, 
@@ -635,7 +673,7 @@ def rerank_with_cross_encoder(query, docs, doc_ids, metadata_list, top_k=5):
             for doc_id, doc, meta, score in zip(doc_ids, docs, metadata_list, scores)
         ]
         
-        # 按得分排序
+        # 🎯 按得分从高到低排序
         results = sorted(results, key=lambda x: x[1]['score'], reverse=True)
         
         # 返回前K个结果
@@ -673,13 +711,13 @@ def get_llm_relevance_score(query, doc):
         
         # 调用本地LLM
         response = session.post(
-            "http://localhost:11434/api/generate",
+            "http://localhost:11434/api/generate",   # Ollama API端点
             json={
-                "model": "deepseek-r1:1.5b",  # 使用较小模型进行评分
-                "prompt": prompt,
-                "stream": False
+                "model": "deepseek-r1:1.5b",  # 🎯 指定使用的模型，这里使用较小模型进行评分
+                "prompt": prompt,             # 🔤 输入的提示词
+                "stream": False               # 🔄 是否流式输出
             },
-            timeout=180
+            timeout=180 # ⏱️ 3分钟超时
         )
         
         # 提取得分
@@ -865,7 +903,7 @@ def stream_answer(question, enable_web_search=False, model_choice="ollama", prog
         if model_choice == "siliconflow":
             # 对于SiliconFlow API，不支持流式响应，所以一次性获取
             progress(0.8, desc="通过SiliconFlow API生成回答...")
-            full_answer = call_siliconflow_api(prompt, temperature=0.7, max_tokens=1536)
+            full_answer = call_siliconflow_api(prompt, temperature=0.3, max_tokens=1536)
             
             # 处理思维链
             if "<think>" in full_answer and "</think>" in full_answer:
@@ -873,13 +911,13 @@ def stream_answer(question, enable_web_search=False, model_choice="ollama", prog
             else:
                 processed_answer = full_answer
                 
-            yield processed_answer, "完成!"
+            yield processed_answer, "完成!"    # 🔄 使用 yield 流式返回
         else:
             # 使用本地Ollama模型的流式响应
             response = session.post(
                 "http://localhost:11434/api/generate",
                 json={
-                    "model": "deepseek-r1:1.5b",
+                    "model": "deepseek-r1:7b",  # 🎯 使用大模型生成高质量回答
                     "prompt": prompt,
                     "stream": True
                 },
@@ -887,7 +925,7 @@ def stream_answer(question, enable_web_search=False, model_choice="ollama", prog
                 stream=True
             )
             
-            for line in response.iter_lines():
+            for line in response.iter_lines():          # 🔄 逐行处理流式数据
                 if line:
                     chunk = json.loads(line.decode()).get("response", "")
                     full_answer += chunk
@@ -899,7 +937,7 @@ def stream_answer(question, enable_web_search=False, model_choice="ollama", prog
                     else:
                         processed_answer = full_answer
                     
-                    yield processed_answer, "生成回答中..."
+                    yield processed_answer, "生成回答中..."  # 🔄 实时 yield 给前端
                     
             # 处理最终输出，确保应用思维链处理
             final_answer = process_thinking_content(full_answer)
@@ -1000,15 +1038,15 @@ def query_answer(question, enable_web_search=False, model_choice="ollama", progr
         # 根据模型选择使用不同的API
         if model_choice == "siliconflow":
             # 使用SiliconFlow API
-            result = call_siliconflow_api(prompt, temperature=0.7, max_tokens=1536)
+            result = call_siliconflow_api(prompt, temperature=0.3, max_tokens=1536)
             
             # 处理思维链
             processed_result = process_thinking_content(result)
             return processed_result
         else:
-            # 使用本地Ollama
+            # 使用本地Ollama，通过HTTP API调用
             response = session.post(
-                "http://localhost:11434/api/generate",
+                "http://localhost:11434/api/generate", # 本地 API服务地址
                 json={
                     "model": "deepseek-r1:7b",
                     "prompt": prompt,
@@ -1092,7 +1130,7 @@ def process_thinking_content(text):
     
     return processed_text
 
-def call_siliconflow_api(prompt, temperature=0.7, max_tokens=1024):
+def call_siliconflow_api(prompt, temperature=0.3, max_tokens=1024):
     """
     调用SiliconFlow API获取回答
     
@@ -1111,24 +1149,24 @@ def call_siliconflow_api(prompt, temperature=0.7, max_tokens=1024):
 
     try:
         payload = {
-            "model": "Pro/deepseek-ai/DeepSeek-R1",
+            "model": "Qwen/Qwen3-8B",  # 🤖 指定使用的模型
             "messages": [
                 {
                     "role": "user",
                     "content": prompt
                 }
             ],
-            "stream": False,
-            "max_tokens": max_tokens,
-            "stop": None,
+            "stream": False,            # 🔄 非流式响应
+            "max_tokens": max_tokens,   # 📝 最大生成长度
+            "stop": None,               # 🛑 停止标记
             "temperature": temperature,
-            "top_p": 0.7,
-            "top_k": 50,
-            "frequency_penalty": 0.5,
-            "n": 1,
-            "response_format": {"type": "text"}
+            "top_p": 0.7,               # 🎯 核采样参
+            "top_k": 50,                # 🔢 K采样参数
+            "frequency_penalty": 0.5,   # 📊 频率惩罚
+            "n": 1,                     # 🔢 生成数量
+            "response_format": {"type": "text"}  # 📋 响应格式
         }
-
+        # 🌐 构建请求头
         headers = {
             "Authorization": f"Bearer {SILICONFLOW_API_KEY.strip()}", # 从环境变量获取密钥并去除空格
             "Content-Type": "application/json; charset=utf-8" # 明确指定编码
@@ -1137,6 +1175,7 @@ def call_siliconflow_api(prompt, temperature=0.7, max_tokens=1024):
         # 手动将payload编码为UTF-8 JSON字符串
         json_payload = json.dumps(payload, ensure_ascii=False).encode('utf-8')
 
+        # 📡 发送HTTP请求
         response = requests.post(
             SILICONFLOW_API_URL,
             data=json_payload, # 通过data参数发送编码后的JSON
@@ -1188,7 +1227,7 @@ def hybrid_merge(semantic_results, bm25_results, alpha=0.7):
     merged_dict = {}
     global faiss_metadatas_map # Ensure we can access the global map
     
-    # 处理语义搜索结果
+    # 🧠 处理语义检索结果 (FAISS向量相似度)
     if (semantic_results and 
         isinstance(semantic_results.get('documents'), list) and len(semantic_results['documents']) > 0 and
         isinstance(semantic_results.get('metadatas'), list) and len(semantic_results['metadatas']) > 0 and
@@ -1202,16 +1241,17 @@ def hybrid_merge(semantic_results, bm25_results, alpha=0.7):
         # Assuming semantic_results are already ordered by relevance (higher is better)
         # A simple rank-based score, can be replaced if actual scores/distances are available and preferred
         for i, (doc_id, doc, meta) in enumerate(zip(semantic_results['ids'][0], semantic_results['documents'][0], semantic_results['metadatas'][0])):
+            # 基于排名的得分计算
             score = 1.0 - (i / max(1, num_results)) # Higher rank (smaller i) gets higher score
             merged_dict[doc_id] = {
-                'score': alpha * score, 
+                'score': alpha * score,  # 🎯 70%权重给语义相似度
                 'content': doc,
                 'metadata': meta
             }
     else:
         logging.warning("Semantic results are missing, have an unexpected format, or are empty. Skipping semantic part in hybrid merge.")
     
-    # 处理BM25结果
+    # 🔤 处理BM25关键词检索结果 
     if not bm25_results:
         return sorted(merged_dict.items(), key=lambda x: x[1]['score'], reverse=True)
         
@@ -1228,15 +1268,18 @@ def hybrid_merge(semantic_results, bm25_results, alpha=0.7):
         normalized_score = result['score'] / max_bm25_score if max_bm25_score > 0 else 0
         
         if doc_id in merged_dict:
+            # 已存在的文档，累加BM25得分
             merged_dict[doc_id]['score'] += (1 - alpha) * normalized_score
         else:
+            # 新文档，创建条目
             metadata = faiss_metadatas_map.get(doc_id, {}) # Get metadata from our global map
             merged_dict[doc_id] = {
-                'score': (1 - alpha) * normalized_score,
+                'score': (1 - alpha) * normalized_score, # 🎯 30%权重给关键词匹配
                 'content': result['content'],
                 'metadata': metadata
             }
-    
+
+    # 📊 按综合得分排序
     merged_results = sorted(merged_dict.items(), key=lambda x: x[1]['score'], reverse=True)
     return merged_results
 
@@ -1278,7 +1321,7 @@ def get_system_models_info():
     """返回系统使用的各种模型信息"""
     models_info = {
         "嵌入模型": "all-MiniLM-L6-v2",
-        "分块方法": "RecursiveCharacterTextSplitter (chunk_size=800, overlap=150)",
+        "分块方法": "RecursiveCharacterTextSplitter (chunk_size=400, overlap=40)",
         "检索方法": "向量检索 + BM25混合检索 (α=0.7)",
         "重排序模型": "交叉编码器 (sentence-transformers/distiluse-base-multilingual-cased-v2)",
         "生成模型": "deepseek-r1 (7B/1.5B)",
@@ -1667,7 +1710,7 @@ with gr.Blocks(
                     with gr.Group():
                         file_input = gr.File(
                             label="上传PDF文档",
-                            file_types=[".pdf"],
+                            file_types=[".pdf", ".txt", ".docx", ".csv", ".xls", ".xlsx", ".html", ".md"],
                             file_count="multiple"
                         )
                         upload_btn = gr.Button("🚀 开始处理", variant="primary")
@@ -1817,7 +1860,7 @@ with gr.Blocks(
         </div>
         """ % (
             "已启用" if enable_web_search else "未启用", 
-            "Cloud DeepSeek-R1 模型" if model_choice == "siliconflow" else "本地 Ollama 模型",
+            "Cloud Qwen/Qwen3-8B 模型" if model_choice == "siliconflow" else "本地 Ollama 模型",
             "(需要在.env文件中配置SERPAPI_KEY)" if enable_web_search else ""
         )
         
@@ -1846,7 +1889,7 @@ with gr.Blocks(
         </div>
         """ % (
             "已启用" if enable_web_search else "未启用", 
-            "Cloud DeepSeek-R1 模型" if model_choice == "siliconflow" else "本地 Ollama 模型",
+            "Cloud Qwen/Qwen3-8B 模型" if model_choice == "siliconflow" else "本地 Ollama 模型",
             "(需要在.env文件中配置SERPAPI_KEY)" if enable_web_search else ""
         )
         return api_text
@@ -1861,7 +1904,7 @@ with gr.Blocks(
 
     # 绑定提问按钮
     ask_btn.click(
-        process_chat,
+        process_chat,  # 这个函数内部调用 stream_answer
         inputs=[question_input, chatbot, web_search_checkbox, model_choice],
         outputs=[chatbot, question_input, api_info]
     )
@@ -1936,33 +1979,58 @@ def is_port_available(port):
         s.settimeout(1)
         return s.connect_ex(('127.0.0.1', port)) != 0  # 更可靠的检测方式
 
-def check_environment():
-    """环境依赖检查"""
-    try:
-        # 添加模型存在性检查
-        model_check = session.post(
-            "http://localhost:11434/api/show",
-            json={"name": "deepseek-r1:7b"},
-            timeout=10
-        )
-        if model_check.status_code != 200:
-            print("模型未加载！请先执行：")
-            print("ollama pull deepseek-r1:7b")
-            return False
+#def check_environment():
+    # """环境依赖检查"""
+    # try:
+    #     # 添加模型存在性检查
+    #     model_check = session.post(
+    #         "http://localhost:11434/api/show",
+    #         json={"name": "deepseek-r1:7b"},
+    #         timeout=10
+    #     )
+    #     if model_check.status_code != 200:
+    #         print("模型未加载！请先执行：")
+    #         print("ollama pull deepseek-r1:7b")
+    #         return False
             
-        # 原有检查保持不变...
-        response = session.get(
-            "http://localhost:11434/api/tags",
-            proxies={"http": None, "https": None},  # 禁用代理
-            timeout=5
-        )
-        if response.status_code != 200:
-            print("Ollama服务异常，返回状态码:", response.status_code)
-            return False
-        return True
-    except Exception as e:
-        print("Ollama连接失败:", str(e))
+    #     # 原有检查保持不变...
+    #     response = session.get(
+    #         "http://localhost:11434/api/tags",
+    #         proxies={"http": None, "https": None},  # 禁用代理
+    #         timeout=5
+    #     )
+    #     if response.status_code != 200:
+    #         print("Ollama服务异常，返回状态码:", response.status_code)
+    #         return False
+    #     return True
+    # except Exception as e:
+    #     print("Ollama连接失败:", str(e))
+    #     return False
+def check_environment():
+    """环境依赖检查（云端API版本）"""
+    # 检查 SiliconFlow API 密钥
+    if not SILICONFLOW_API_KEY:
+        print("❌ 未配置 SiliconFlow API 密钥")
+        print("请在 .env 文件中设置 SILICONFLOW_API_KEY")
         return False
+    
+    print("✅ SiliconFlow API 密钥已配置")
+    print("✅ 跳过本地 Ollama 检查，使用云端 API 模式")
+    
+    # 测试 SiliconFlow API 连接
+    try:
+        test_prompt = "你好，请回复'连接成功'"
+        result = call_siliconflow_api(test_prompt, temperature=0.1, max_tokens=50)
+        if "连接成功" in result or "你好" in result:
+            print("✅ SiliconFlow API 连接测试成功")
+            return True
+        else:
+            print("⚠️ SiliconFlow API 响应异常，但继续运行")
+            return True
+    except Exception as e:
+        print(f"⚠️ SiliconFlow API 测试失败: {e}")
+        print("⚠️ 继续运行，请确保 API 密钥正确")
+        return True
 
 # 方案2：禁用浏览器缓存（添加meta标签）
 gr.HTML("""
@@ -1973,8 +2041,17 @@ gr.HTML("""
 
 # 恢复主程序启动部分
 if __name__ == "__main__":
-    if not check_environment():
+        # 强制使用云端模式，跳过 Ollama 检查
+    print("🚀 启动云端 RAG 系统...")
+    
+    if not SILICONFLOW_API_KEY:
+        print("❌ 未配置 SiliconFlow API 密钥")
+        print("请在 .env 文件中设置：SILICONFLOW_API_KEY=your_key_here")
         exit(1)
+    
+    print(f"✅ SiliconFlow API 密钥: ...{SILICONFLOW_API_KEY[-8:]}")
+    
+    # 端口检查和启动
     ports = [17995, 17996, 17997, 17998, 17999]
     selected_port = next((p for p in ports if is_port_available(p)), None)
     
@@ -1983,12 +2060,7 @@ if __name__ == "__main__":
         exit(1)
         
     try:
-        ollama_check = session.get("http://localhost:11434", timeout=5)
-        if ollama_check.status_code != 200:
-            print("Ollama服务未正常启动！")
-            print("请先执行：ollama serve 启动服务")
-            exit(1)
-            
+        print(f"🌐 启动地址: http://127.0.0.1:{selected_port}")
         webbrowser.open(f"http://127.0.0.1:{selected_port}")
         demo.launch(
             server_port=selected_port,
@@ -1999,4 +2071,30 @@ if __name__ == "__main__":
         )
     except Exception as e:
         print(f"启动失败: {str(e)}")
+    # if not check_environment():
+    #     exit(1)
+    # ports = [17995, 17996, 17997, 17998, 17999]
+    # selected_port = next((p for p in ports if is_port_available(p)), None)
+    
+    # if not selected_port:
+    #     print("所有端口都被占用，请手动释放端口")
+    #     exit(1)
+        
+    # try:
+    #     ollama_check = session.get("http://localhost:11434", timeout=5)
+    #     if ollama_check.status_code != 200:
+    #         print("Ollama服务未正常启动！")
+    #         print("请先执行：ollama serve 启动服务")
+    #         exit(1)
+            
+    #     webbrowser.open(f"http://127.0.0.1:{selected_port}")
+    #     demo.launch(
+    #         server_port=selected_port,
+    #         server_name="0.0.0.0",
+    #         show_error=True,
+    #         ssl_verify=False,
+    #         height=900
+    #     )
+    # except Exception as e:
+    #     print(f"启动失败: {str(e)}")
 

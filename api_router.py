@@ -14,7 +14,7 @@ import asyncio
 from contextlib import asynccontextmanager
 
 # 从rag_demo导入所需功能
-import rag_demo
+import rag_demo_pro as rag_demo
 from io import StringIO
 
 # 配置日志
