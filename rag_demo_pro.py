@@ -32,6 +32,7 @@ from typing import List, Tuple, Any, Optional
 from docx import Document
 import pandas as pd
 from bs4 import BeautifulSoup
+import pickle 
 
 # 加载环境变量
 load_dotenv()
@@ -55,9 +56,12 @@ import os
 os.environ['NO_PROXY'] = 'localhost,127.0.0.1'  # 新增：设置不使用代理的地址
 
 # 初始化组件
-EMBED_MODEL = SentenceTransformer('all-MiniLM-L6-v2')
+#EMBED_MODEL = SentenceTransformer('all-MiniLM-L6-v2')
 # 嵌入模型也可以切换为针对中文优化的模型，例如：
-# EMBED_MODEL = SentenceTransformer('shibing624/text2vec-base-chinese')
+#EMBED_MODEL = SentenceTransformer('shibing624/text2vec-base-chinese')
+#平衡速度与精度，中文检索效果佳
+EMBED_MODEL = SentenceTransformer('BAAI/bge-base-zh-v1.5')
+
 
 # FAISS 相关的全局变量
 faiss_index = None
@@ -77,8 +81,8 @@ def get_cross_encoder():
         with cross_encoder_lock:
             if cross_encoder is None:
                 try:
-                    # 使用多语言交叉编码器，更适合中文
-                    cross_encoder = CrossEncoder('sentence-transformers/distiluse-base-multilingual-cased-v2')
+                    # 使用更专业的中文重排序模型
+                    cross_encoder = CrossEncoder('BAAI/bge-reranker-base')
                     logging.info("交叉编码器加载成功")
                 except Exception as e:
                     logging.error(f"加载交叉编码器失败: {str(e)}")
@@ -87,7 +91,7 @@ def get_cross_encoder():
     return cross_encoder
 
 # 新增：BM25索引管理
-def recursive_retrieval(initial_query, max_iterations=3, enable_web_search=False, model_choice="ollama"):
+def recursive_retrieval(initial_query, max_iterations=3, enable_web_search=False, model_choice="siliconflow"):
     """
     实现递归检索与迭代查询功能
     通过分析当前查询结果，确定是否需要进一步查询
@@ -130,7 +134,7 @@ def recursive_retrieval(initial_query, max_iterations=3, enable_web_search=False
                 logging.error(f"网络搜索错误: {str(e)}")
 
         # 2️⃣ 语义检索 (FAISS)
-        query_embedding = EMBED_MODEL.encode([query])
+        query_embedding = EMBED_MODEL.encode([query]) #将查询文本转换为向量表示
         query_embedding_np = np.array(query_embedding).astype('float32')
         
         semantic_results_docs = []
@@ -139,7 +143,21 @@ def recursive_retrieval(initial_query, max_iterations=3, enable_web_search=False
 
         if faiss_index and faiss_index.ntotal > 0:
             try:
-                D, I = faiss_index.search(query_embedding_np, k=10) # D: distances, I: indices
+                # 动态调整nprobe以平衡速度和精度
+                original_nprobe = None
+                if hasattr(faiss_index, 'nprobe'):
+                    original_nprobe = faiss_index.nprobe
+                    # 对于第一次检索，可以使用更多的探针以提高精度
+                    if i == 0:
+                        faiss_index.nprobe = min(20, max(faiss_index.nprobe, faiss_index.nlist // 10))
+            
+                D, I = faiss_index.search(query_embedding_np, k=10)
+            
+                # 恢复原始nprobe设置
+                if original_nprobe is not None and hasattr(faiss_index, 'nprobe'):
+                    faiss_index.nprobe = original_nprobe
+                    
+                # D, I = faiss_index.search(query_embedding_np, k=10) # D: distances, I: indices
                 # I contains the internal FAISS indices. We need to map them back to original IDs.
                 for faiss_idx in I[0]: # I[0] because query_embedding_np was a batch of 1
                     if faiss_idx != -1 and faiss_idx < len(faiss_id_order_for_index):
@@ -529,6 +547,68 @@ def extract_text(filepath):
             return f"暂不支持该文件类型: {ext}"
     except Exception as e:
         return f"文件解析失败: {str(e)}"
+    
+def create_ivfpq_index(embeddings_np):
+    """
+    创建FAISS索引 - 根据数据量自动选择合适的索引类型
+    """
+    dimension = embeddings_np.shape[1]
+    num_vectors = embeddings_np.shape[0]
+    
+    logging.info(f"准备创建索引: dimension={dimension}, vectors={num_vectors}")
+    
+    # 对于小数据集，使用简单的IndexFlatL2
+    if num_vectors < 1000:
+        logging.info("数据量较小，使用IndexFlatL2精确搜索")
+        index = faiss.IndexFlatL2(dimension)
+        return index
+    
+    # 对于中等数据集，使用IVFFlat
+    elif num_vectors < 10000:
+        nlist = min(100, max(10, int(np.sqrt(num_vectors))))
+        logging.info(f"使用IVFFlat索引: nlist={nlist}")
+        
+        quantizer = faiss.IndexFlatL2(dimension)
+        index = faiss.IndexIVFFlat(quantizer, dimension, nlist)
+        
+        # 确保有足够的训练数据
+        if num_vectors < 4 * nlist:
+            nlist = max(1, num_vectors // 4)
+            logging.warning(f"调整nlist为 {nlist} 以适应训练数据量")
+            quantizer = faiss.IndexFlatL2(dimension)
+            index = faiss.IndexIVFFlat(quantizer, dimension, nlist)
+        
+        index.train(embeddings_np)
+        return index
+    
+    # 对于大数据集，使用IVFPQ
+    else:
+        nlist = min(1000, max(10, int(np.sqrt(num_vectors))))
+        
+        # 更保守的M值选择
+        candidates = [32, 16, 8, 4, 2, 1]
+        M = 1
+        for candidate in candidates:
+            if dimension % candidate == 0 and candidate <= min(32, dimension):
+                M = candidate
+                break
+        
+        logging.info(f"使用IVFPQ索引: dimension={dimension}, nlist={nlist}, M={M}")
+        
+        # 确保有足够的训练数据
+        min_training_points = max(256, 4 * nlist)
+        if num_vectors < min_training_points:
+            logging.warning(f"数据量({num_vectors})不足以使用IVFPQ，降级为IVFFlat")
+            nlist = max(1, num_vectors // 4)
+            quantizer = faiss.IndexFlatL2(dimension)
+            index = faiss.IndexIVFFlat(quantizer, dimension, nlist)
+            index.train(embeddings_np)
+            return index
+        
+        quantizer = faiss.IndexFlatL2(dimension)
+        index = faiss.IndexIVFPQ(quantizer, dimension, nlist, M, 8)
+        index.train(embeddings_np)
+        return index
 
 def process_multiple_pdfs(files: List[Any], progress=gr.Progress()):
     """处理多个PDF文件"""
@@ -597,7 +677,8 @@ def process_multiple_pdfs(files: List[Any], progress=gr.Progress()):
                 logging.error(f"处理文件 {file_name} 时出错: {error_msg}")
                 file_processor.update_status(file_name, f"处理失败: {error_msg}")
                 processed_results.append(f"❌ {file_name}: 处理失败 - {error_msg}")
-        
+
+        # 批量向量化处理
         if all_new_chunks:
             progress(0.8, desc="生成文本嵌入...")
             embeddings = EMBED_MODEL.encode(all_new_chunks, show_progress_bar=True)
@@ -605,16 +686,22 @@ def process_multiple_pdfs(files: List[Any], progress=gr.Progress()):
             
             progress(0.9, desc="构建FAISS索引...")
             if faiss_index is None: # Should always be None here due to clearing
-                dimension = embeddings_np.shape[1]
-                faiss_index = faiss.IndexFlatL2(dimension)
+                # dimension = embeddings_np.shape[1]  # 获取向量维度               
+                # faiss_index = faiss.IndexFlatL2(dimension)  #使用L2距离（欧几里得距离）进行精确搜索
+                faiss_index = create_ivfpq_index(embeddings_np)
             
-            faiss_index.add(embeddings_np)
-            
+            faiss_index.add(embeddings_np) #将所有文档块的嵌入向量添加到FAISS索引中：embeddings_np是所有文档块嵌入向量组成的numpy数组
+                                        #FAISS会为每个向量分配一个内部索引ID（从0开始递增）          
             for i, original_id in enumerate(all_new_original_ids):
                 faiss_contents_map[original_id] = all_new_chunks[i]
                 faiss_metadatas_map[original_id] = all_new_metadatas[i]
             faiss_id_order_for_index.extend(all_new_original_ids) # Keep track of order for FAISS indices
             logging.info(f"FAISS索引构建完成，共索引 {faiss_index.ntotal} 个文本块")
+
+           # 在索引创建后设置nprobe
+            if hasattr(faiss_index, 'nprobe'):
+                # 设置合理的nprobe值，通常为nlist的5-10%
+                faiss_index.nprobe = max(1, min(20, faiss_index.nlist // 20))
 
         summary = f"\n总计处理 {total_files} 个文件，{total_chunks} 个文本块"
         processed_results.append(summary)
@@ -648,8 +735,10 @@ def rerank_with_cross_encoder(query, docs, doc_ids, metadata_list, top_k=5):
     """
     if not docs:
         return []
-        
+    
+    # 加载交叉编码器模型  
     encoder = get_cross_encoder()
+
     if encoder is None:
         logging.warning("交叉编码器不可用，跳过重排序")
         # 返回原始顺序（按索引排序）
@@ -810,7 +899,7 @@ def rerank_results(query, docs, doc_ids, metadata_list, method=None, top_k=5):
         return [(doc_id, {'content': doc, 'metadata': meta, 'score': 1.0 - idx/len(docs)}) 
                 for idx, (doc_id, doc, meta) in enumerate(zip(doc_ids, docs, metadata_list))]
 
-def stream_answer(question, enable_web_search=False, model_choice="ollama", progress=gr.Progress()):
+def stream_answer(question, enable_web_search=False, model_choice="siliconflow", progress=gr.Progress()):
     """改进的流式问答处理流程，支持联网搜索、混合检索和重排序，以及多种模型选择"""
     global faiss_index # 确保可以访问
     try:
@@ -946,130 +1035,6 @@ def stream_answer(question, enable_web_search=False, model_choice="ollama", prog
     except Exception as e:
         yield f"系统错误: {str(e)}", "遇到错误"
 
-def query_answer(question, enable_web_search=False, model_choice="ollama", progress=gr.Progress()):
-    """问答处理流程，支持联网搜索、混合检索和重排序，以及多种模型选择"""
-    global faiss_index # 确保可以访问
-    try:
-        logging.info(f"收到问题：{question}，联网状态：{enable_web_search}，模型选择：{model_choice}")
-        
-        # 检查向量数据库是否为空
-        knowledge_base_exists = faiss_index is not None and faiss_index.ntotal > 0
-        if not knowledge_base_exists:
-                if not enable_web_search:
-                    return "⚠️ 知识库为空，请先上传文档。"
-                else:
-                    logging.warning("知识库为空，将仅使用网络搜索结果")
-        
-        progress(0.3, desc="执行递归检索...")
-        # 使用递归检索获取更全面的答案上下文
-        all_contexts, all_doc_ids, all_metadata = recursive_retrieval(
-            initial_query=question,
-            max_iterations=3,
-            enable_web_search=enable_web_search,
-            model_choice=model_choice
-        )
-        
-        # 组合上下文，包含来源信息
-        context_with_sources = []
-        sources_for_conflict_detection = []
-        
-        # 使用检索到的结果构建上下文
-        for doc, doc_id, metadata in zip(all_contexts, all_doc_ids, all_metadata):
-            source_type = metadata.get('source', '本地文档')
-            
-            source_item = {
-                'text': doc,
-                'type': source_type
-            }
-            
-            if source_type == 'web':
-                url = metadata.get('url', '未知URL')
-                title = metadata.get('title', '未知标题')
-                context_with_sources.append(f"[网络来源: {title}] (URL: {url})\n{doc}")
-                source_item['url'] = url
-                source_item['title'] = title
-            else:
-                source = metadata.get('source', '未知来源')
-                context_with_sources.append(f"[本地文档: {source}]\n{doc}")
-                source_item['source'] = source
-            
-            sources_for_conflict_detection.append(source_item)
-        
-        # 检测矛盾
-        conflict_detected = detect_conflicts(sources_for_conflict_detection)
-        
-        # 获取可信源
-        if conflict_detected:
-            credible_sources = [s for s in sources_for_conflict_detection 
-                              if s['type'] == 'web' and evaluate_source_credibility(s) > 0.7]
-        
-        context = "\n\n".join(context_with_sources)
-        
-        # 添加时间敏感检测
-        time_sensitive = any(word in question for word in ["最新", "今年", "当前", "最近", "刚刚"])
-        
-        # 改进提示词模板，提高回答质量
-        prompt_template = """作为一个专业的问答助手，你需要基于以下{context_type}回答用户问题。
-
-提供的参考内容：
-{context}
-
-用户问题：{question}
-
-请遵循以下回答原则：
-1. 仅基于提供的参考内容回答问题，不要使用你自己的知识
-2. 如果参考内容中没有足够信息，请坦诚告知你无法回答
-3. 回答应该全面、准确、有条理，并使用适当的段落和结构
-4. 请用中文回答
-5. 在回答末尾标注信息来源{time_instruction}{conflict_instruction}
-
-请现在开始回答："""
-        
-        prompt = prompt_template.format(
-            context_type="本地文档和网络搜索结果" if enable_web_search and knowledge_base_exists else ("网络搜索结果" if enable_web_search else "本地文档"),
-            context=context if context else ("网络搜索结果将用于回答。" if enable_web_search and not knowledge_base_exists else "知识库为空或未找到相关内容。"),
-            question=question,
-            time_instruction="，优先使用最新的信息" if time_sensitive and enable_web_search else "",
-            conflict_instruction="，并明确指出不同来源的差异" if conflict_detected else ""
-        )
-        
-        progress(0.8, desc="生成回答...")
-        
-        # 根据模型选择使用不同的API
-        if model_choice == "siliconflow":
-            # 使用SiliconFlow API
-            result = call_siliconflow_api(prompt, temperature=0.3, max_tokens=1536)
-            
-            # 处理思维链
-            processed_result = process_thinking_content(result)
-            return processed_result
-        else:
-            # 使用本地Ollama，通过HTTP API调用
-            response = session.post(
-                "http://localhost:11434/api/generate", # 本地 API服务地址
-                json={
-                    "model": "deepseek-r1:7b",
-                    "prompt": prompt,
-                    "stream": False
-                },
-                timeout=180,  # 延长到3分钟
-                headers={'Connection': 'close'}  # 添加连接头
-            )
-            response.raise_for_status()  # 检查HTTP状态码
-            
-            progress(1.0, desc="完成!")
-            # 确保返回字符串并处理空值
-            result = response.json()
-            return process_thinking_content(str(result.get("response", "未获取到有效回答")))
-            
-    except json.JSONDecodeError:
-        return "响应解析失败，请重试"
-    except KeyError:
-        return "响应格式异常，请检查模型服务"
-    except Exception as e:
-        progress(1.0, desc="遇到错误")  # 确保进度条完成
-        return f"系统错误: {str(e)}"
-
 def process_thinking_content(text):
     """处理包含<think>标签的内容，将其转换为Markdown格式"""
     # 检查输入是否为有效文本
@@ -1149,7 +1114,10 @@ def call_siliconflow_api(prompt, temperature=0.3, max_tokens=1024):
 
     try:
         payload = {
-            "model": "Qwen/Qwen3-8B",  # 🤖 指定使用的模型
+             # 🔄 修改这里的模型名称
+            #"model": "Qwen/Qwen2.5-72B-Instruct",  # 或其他可用模型
+             "model": "deepseek-ai/DeepSeek-V3",
+            # "model": "meta-llama/Llama-3.1-405B-Instruct",
             "messages": [
                 {
                     "role": "user",
@@ -1320,12 +1288,21 @@ def update_bm25_index():
 def get_system_models_info():
     """返回系统使用的各种模型信息"""
     models_info = {
-        "嵌入模型": "all-MiniLM-L6-v2",
+        "嵌入模型": "BAAI/bge-base-zh-v1.5 (SentenceTransformer)",
+
         "分块方法": "RecursiveCharacterTextSplitter (chunk_size=400, overlap=40)",
-        "检索方法": "向量检索 + BM25混合检索 (α=0.7)",
-        "重排序模型": "交叉编码器 (sentence-transformers/distiluse-base-multilingual-cased-v2)",
-        "生成模型": "deepseek-r1 (7B/1.5B)",
+
+        "检索方法": "FAISS 向量检索 + BM25 混合检索 (α=0.7)",
+
+        "重排序模型": "BAAI/bge-reranker-base (CrossEncoder)；可选 LLM 重排：deepseek-r1:1.5b",
+
+        "生成模型": "Cloud: deepseek-ai/DeepSeek-V3 (SiliconFlow)；Local: deepseek-r1:7b (Ollama)",
+
+        "辅助模型": "deepseek-r1:1.5b（查询优化/相关性打分）",
+
         "分词工具": "jieba (中文分词)"
+
+
     }
     return models_info
 
@@ -1746,7 +1723,7 @@ with gr.Blocks(
                             # 添加模型选择下拉框
                             model_choice = gr.Dropdown(
                                 choices=["ollama", "siliconflow"],
-                                value="ollama",
+                                value="siliconflow",
                                 label="模型选择",
                                 info="选择使用本地模型或云端模型"
                             )
@@ -1760,7 +1737,7 @@ with gr.Blocks(
                         """
                         <div class="api-info" style="margin-top:10px;padding:10px;border-radius:5px;background:var(--panel-bg);border:1px solid var(--border-color);">
                             <p>📢 <strong>功能说明：</strong></p>
-                            <p>1. <strong>联网搜索</strong>：%s</p>
+                            <p>1. <strong>联网搜索</strong>:%s</p>
                             <p>2. <strong>模型选择</strong>：当前使用 <strong>%s</strong> %s</p>
                         </div>
                         """
@@ -1775,7 +1752,8 @@ with gr.Blocks(
                         label="对话历史",
                         height=600,  # 增加高度
                         elem_classes="chat-container",
-                        show_label=False
+                        show_label=False,
+                        type="messages"  # 添加这行
                     )
                     
                     status_display = gr.HTML("", elem_id="status-display")
@@ -1845,9 +1823,9 @@ with gr.Blocks(
 
     # 定义函数处理事件
     def clear_chat_history():
-        return None, "对话已清空"
+         return [], "对话已清空"  # 返回空列表
 
-    def process_chat(question: str, history: Optional[List[Tuple[str, str]]], enable_web_search: bool, model_choice: str):
+    def process_chat(question: str, history, enable_web_search: bool, model_choice: str):
         if history is None:
             history = []
         
@@ -1860,24 +1838,39 @@ with gr.Blocks(
         </div>
         """ % (
             "已启用" if enable_web_search else "未启用", 
-            "Cloud Qwen/Qwen3-8B 模型" if model_choice == "siliconflow" else "本地 Ollama 模型",
+            "Cloud deepseek-ai/DeepSeek-V3 模型" if model_choice == "siliconflow" else "本地 Ollama 模型",
             "(需要在.env文件中配置SERPAPI_KEY)" if enable_web_search else ""
         )
         
         # 如果问题为空，不处理
         if not question or question.strip() == "":
-            history.append(("", "问题不能为空，请输入有效问题。"))
+            # ✅ 使用字典格式
+            history.append({
+                "role": "assistant",
+                "content": "问题不能为空，请输入有效问题。"
+            })
             return history, "", api_text
         
-        # 添加用户问题到历史
-        history.append((question, ""))
+        # ✅ 添加用户问题到历史 - 使用新的消息格式
+        history.append({
+            "role": "user", 
+            "content": question
+        })
+        history.append({
+            "role": "assistant",
+            "content": ""
+        })
         
         # 创建生成器
         resp_generator = stream_answer(question, enable_web_search, model_choice)
         
         # 流式更新回答
         for response, status in resp_generator:
-            history[-1] = (question, response)
+            # ✅ 更新为字典格式
+            history[-1] = {
+                "role": "assistant",
+                "content": response
+            }
             yield history, "", api_text
 
     def update_api_info(enable_web_search, model_choice):
@@ -1889,7 +1882,7 @@ with gr.Blocks(
         </div>
         """ % (
             "已启用" if enable_web_search else "未启用", 
-            "Cloud Qwen/Qwen3-8B 模型" if model_choice == "siliconflow" else "本地 Ollama 模型",
+            "Cloud deepseek-ai/DeepSeek-V3 模型" if model_choice == "siliconflow" else "本地 Ollama 模型",
             "(需要在.env文件中配置SERPAPI_KEY)" if enable_web_search else ""
         )
         return api_text
